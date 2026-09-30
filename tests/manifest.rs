@@ -66,13 +66,20 @@ fn no_runtime_and_no_socket_crate() {
 /// cargo's declared dependencies of every workspace member, where a normal,
 /// build or dev edge, renamed, target-qualified or optional, all name the
 /// package, so every route to this crate is seen and not only a manifest line
-/// spelled `weaver-analysis =`. The member set is checked against every
-/// `crates/*/Cargo.toml` first, so a crate standing outside the workspace
-/// refuses rather than going unread.
+/// spelled `weaver-analysis =`.
 ///
-/// Perturbation: add `weaver-analysis = { path = "../weaver-analysis" }` under
-/// another member's `[dev-dependencies]`, or the same under a rename, and this
-/// fails naming that member. Watched under exactly those changes.
+/// **Since 2026-09-30 the workspace is this crate alone.** The condition was
+/// written against a monorepo, where it was checked against every
+/// `crates/*/Cargo.toml` so a crate standing outside the workspace refused
+/// rather than going unread. The split into its own repository made the
+/// condition structural: an interior crate that wanted this one would have to
+/// reach across repositories to name it. What this test still reads is that
+/// the workspace cargo answers for is exactly this crate, so a second member
+/// added here, the one way the condition could quietly return, refuses.
+///
+/// Perturbation: add a second package to `[workspace] members`, or give it a
+/// dependency on this crate, and this fails naming it. Watched under exactly
+/// those changes.
 #[test]
 fn no_workspace_crate_depends_on_this_one() {
     let out = Command::new(env!("CARGO"))
@@ -96,32 +103,29 @@ fn no_workspace_crate_depends_on_this_one() {
         serde_json::from_slice(&out.stdout).expect("cargo metadata is json");
     let packages = metadata["packages"].as_array().expect("a package list");
 
-    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the crates directory");
-    let mut on_disk: Vec<std::path::PathBuf> = std::fs::read_dir(crates_dir)
-        .expect("the crates directory reads")
-        .map(|entry| entry.expect("an entry reads").path().join("Cargo.toml"))
-        .filter(|manifest| manifest.is_file())
-        .map(|manifest| manifest.canonicalize().expect("a manifest resolves"))
-        .collect();
-    on_disk.sort();
-    let mut members: Vec<std::path::PathBuf> = packages
+    let names: Vec<&str> = packages
         .iter()
-        .map(|p| {
-            std::path::PathBuf::from(p["manifest_path"].as_str().expect("a manifest path"))
-                .canonicalize()
-                .expect("a member manifest resolves")
-        })
+        .map(|p| p["name"].as_str().expect("a package name"))
         .collect();
-    members.sort();
     assert_eq!(
-        on_disk, members,
-        "every crate under crates/ is a workspace member the read below sees"
+        names,
+        ["weaver-analysis"],
+        "the workspace is this crate alone, and cargo answers for these"
     );
-    assert!(
-        packages.iter().any(|p| p["name"] == "weaver-analysis"),
-        "the read includes this crate, so it is the workspace's metadata"
+    let manifest = std::path::PathBuf::from(
+        packages[0]["manifest_path"]
+            .as_str()
+            .expect("a manifest path"),
+    )
+    .canonicalize()
+    .expect("a member manifest resolves");
+    assert_eq!(
+        manifest,
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml")
+            .canonicalize()
+            .expect("this manifest resolves"),
+        "the one member is the crate at the repository root"
     );
 
     let dependents: Vec<String> = packages
