@@ -1,0 +1,70 @@
+//! conforms: analysis-seal-ends-the-preload
+//!
+//! The preload seam's sender, per `weaver-analysis-Spec` section 4: three
+//! things in one order - the election opens the channel, a distillate per
+//! elected event follows in sequence order, and the seal ends it - and the
+//! seam is owed nothing back. This crate asks nothing on this seam and reads
+//! nothing from it.
+//!
+//! **One preload per standing of this driver, by structure.** Opening
+//! consumes the sink into a sender and sealing consumes the sender, so a
+//! second opener on a channel that carried one is not expressible: a retry
+//! is a new run of this crate rather than a second preload inside one.
+//! **The shape is this module's and the pin that watches it is written in
+//! `lib.rs`**, per Spec section 6, which names a compile-fail pin as the
+//! instrument. The pin reaches the sender through the crate's public
+//! path, `lib.rs` carries the citation beside the doctest it is, and
+//! nothing about the instrument obliged that placement over a pin written
+//! here.
+//!
+//! **The sink is any writer and this module dials nothing.** [`open`]
+//! takes a `W: Write` and never names a socket, so the dial belongs to the
+//! composition root, which opens it under whatever identity the process
+//! was invoked with and mints none, the credential's rightness judged at
+//! the far end by the door.
+
+use std::io::Write;
+
+use crate::project::Distillate;
+
+/// The standing preload: the opener has crossed and distillates may follow.
+/// Constructed only by [`open`], which consumes the sink, and consumed by
+/// [`Sender::seal`].
+pub struct Sender<W: Write> {
+    sink: W,
+}
+
+/// Open with the diagnostic election. The CLI uses `open_with` after
+/// validating the destination and effective rule.
+pub fn open<W: Write>(sink: W, session: &str) -> std::io::Result<Sender<W>> {
+    open_with(sink, session, &crate::selection::Election::diagnostic())
+}
+
+/// Open with the preflight's effective rule, for either mode.
+pub fn open_with<W: Write>(
+    mut sink: W,
+    session: &str,
+    election: &crate::selection::Election,
+) -> std::io::Result<Sender<W>> {
+    sink.write_all(crate::project::render_opener_for(session, election).as_bytes())?;
+    Ok(Sender { sink })
+}
+
+impl<W: Write> Sender<W> {
+    /// One distillate, in the record's order. Takes the projection's own
+    /// type and never a raw event: the sender's shape is the compile-time
+    /// half of the no-writer claim.
+    pub fn send(&mut self, distillate: &Distillate) -> std::io::Result<()> {
+        self.sink.write_all(distillate.frame().as_bytes())
+    }
+
+    /// The seal: one empty JSON object on its own line, `{}` canonically,
+    /// and this crate writes that spelling. A blank line is framing residue
+    /// and not a seal, so the parked replay ask would never answer over
+    /// one. Consumes the sender, which is the one-preload owing met by
+    /// structure.
+    pub fn seal(mut self) -> std::io::Result<()> {
+        self.sink.write_all(b"{}\n")?;
+        self.sink.flush()
+    }
+}

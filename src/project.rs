@@ -1,0 +1,418 @@
+//! conforms: analysis-election-declares-what-follows
+//! conforms: analysis-projection-splices-verbatim
+//! conforms: analysis-sequence-order-preserved
+//! conforms: analysis-preload-cuts-and-renames
+//!
+//! Both preload modes share the raw selector below. Ordinary reconstruction
+//! receives the record's rule from preflight; the diagnostic convenience
+//! functions retain this crate's fixed election. Neither path re-encodes a
+//! selected payload value, and both carry turnless system payloads whole.
+
+use crate::record::{Event, value_at};
+use crate::selection::Election;
+
+/// One elected kind and the payload key paths read out of it.
+#[derive(Debug, Clone)]
+pub struct ElectedKind {
+    pub kind: &'static str,
+    pub paths: &'static [&'static str],
+}
+
+/// The election, composed from what `diagnostic-replay-loop` sections 2 and
+/// 3 read: `load` for the tee's election the state claim rests on,
+/// `model.request` for each generation's rendered contribution and its
+/// identity, `model.measurement` for the recorded token path the
+/// certification compares against, the resident edits and a fault's case
+/// the walk and the identity step read, and the recall's account. A step added to that document widens
+/// this election in the act that adds it.
+pub const ELECTION: &[ElectedKind] = &[
+    ElectedKind {
+        kind: "load",
+        paths: &["tee"],
+    },
+    ElectedKind {
+        kind: "model.request",
+        paths: &["rendered", "template", "sampling"],
+    },
+    ElectedKind {
+        kind: "model.measurement",
+        paths: &["input_tokens", "output_tokens", "model", "weights_hash"],
+    },
+    // **The four message kinds with `role` and `content`**, per Spec
+    // section 3 as of 2026-09-06 and issue #432: a session standing from a
+    // preloaded record rebuilds its prefix and its conversation from these
+    // pairs through the `identity` and `recall` asks, and the replay loop
+    // reads past them untouched, so one election serves both preloads. A
+    // restored message is not among them: it crosses whole by
+    // `project_with`'s rule, as the identity does (#697).
+    ElectedKind {
+        kind: "message.system",
+        paths: &["role", "content"],
+    },
+    ElectedKind {
+        kind: "message.user",
+        paths: &["role", "content"],
+    },
+    ElectedKind {
+        kind: "message.assistant",
+        paths: &["role", "content"],
+    },
+    ElectedKind {
+        kind: "message.tool_result",
+        paths: &["role", "content"],
+    },
+    // **The source's two resident edits, with their counts**, as of
+    // 2026-09-26 per `diagnostic-replay-loop` section 2: the walk reproduces
+    // each where it fell, so a turn after a flush or an elision draws on the
+    // resident the source's did, and the counts are what the reproduction
+    // is held to.
+    ElectedKind {
+        kind: "flush",
+        paths: &["resident_before", "resident_after"],
+    },
+    ElectedKind {
+        kind: "elision",
+        paths: &["from", "to", "resident_before", "resident_after"],
+    },
+    // **A fault's case**, so the identity step can refuse a source whose
+    // open recorded `identity_prefix_unrecorded`: without it the fault never
+    // reaches the holdings at all.
+    ElectedKind {
+        kind: "fault",
+        paths: &["case"],
+    },
+    // **The recall's account**, identities only and bounded, so the
+    // destination carries what the source's post-flush input was drawn from
+    // for a reader, and the cross-check the loop document names as owed has
+    // its evidence the day it lands.
+    ElectedKind {
+        kind: "recall",
+        paths: &["ask", "returned", "count"],
+    },
+];
+
+/// Why a cut refuses before anything is sent, per Spec section 4: the run
+/// or the turn is not the record's, named.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CutRefusal {
+    RunNotHeld(String),
+    TurnNotHeld {
+        run: String,
+        turn: u64,
+    },
+    /// The turn is held and its close is not: a run that died mid-turn, and
+    /// a cut inside a generation is what the cut-by-turn rule refuses.
+    TurnNotClosed {
+        run: String,
+        turn: u64,
+    },
+}
+
+impl std::fmt::Display for CutRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CutRefusal::RunNotHeld(run) => write!(f, "the record holds no run {run:?}"),
+            CutRefusal::TurnNotHeld { run, turn } => {
+                write!(f, "run {run:?} holds no turn {turn}")
+            }
+            CutRefusal::TurnNotClosed { run, turn } => {
+                write!(f, "run {run:?} holds turn {turn} without its close")
+            }
+        }
+    }
+}
+
+/// **The cut**, per Spec section 4 as of 2026-09-04: every event of the
+/// record through the named turn's last event in landing order and none
+/// after it, which is the turn's close where the record is whole. A run the
+/// record does not hold, or a turn that run does not hold, refuses before
+/// anything is sent, and a turn is named beside its run because a turn's
+/// number recurs across runs.
+pub fn cut_through<'a>(
+    events: &'a [Event],
+    run: &str,
+    turn: u64,
+) -> Result<&'a [Event], CutRefusal> {
+    if !events.iter().any(|event| event.envelope.run == run) {
+        return Err(CutRefusal::RunNotHeld(run.to_string()));
+    }
+    let key = format!("t-{turn}");
+    let of_turn = |event: &Event| {
+        event.envelope.run == run && event.envelope.turn.as_deref() == Some(key.as_str())
+    };
+    if !events.iter().any(of_turn) {
+        return Err(CutRefusal::TurnNotHeld {
+            run: run.to_string(),
+            turn,
+        });
+    }
+    // **The cut is the turn's close event**, per Spec section 4: a turn the
+    // record holds without its close is a run that died mid-turn, and
+    // cutting there would land a generation without its close.
+    let close = events
+        .iter()
+        .rposition(|event| of_turn(event) && event.envelope.kind == "turn.closed")
+        .ok_or_else(|| CutRefusal::TurnNotClosed {
+            run: run.to_string(),
+            turn,
+        })?;
+    Ok(&events[..=close])
+}
+
+/// The opener's frame: the election whole, with the session it declares
+/// being the replayed session's own name, per the contract's section 2.
+pub fn render_opener(session: &str) -> String {
+    render_opener_for(session, &Election::diagnostic())
+}
+
+/// Render the rule actually used by the projection.
+pub fn render_opener_for(session: &str, election: &Election) -> String {
+    let mut frame = serde_json::json!({"session": session, "election": election}).to_string();
+    frame.push('\n');
+    frame
+}
+
+/// One distillate: the envelope's five members by name and the elected
+/// pairs beside them, each value spliced as raw text. Carried as the
+/// rendered frame because the value must not pass through a re-encoding on
+/// its way to the wire.
+#[derive(Debug, Clone)]
+pub struct Distillate {
+    frame: String,
+}
+
+impl Distillate {
+    /// The rendered frame, one line, newline-terminated.
+    pub fn frame(&self) -> &str {
+        &self.frame
+    }
+}
+
+/// The projection: every elected event of the record, in the record's
+/// landing order, each distilled to its envelope and its elected pairs. No
+/// sort and no grouping happens here - the loop's pairing runs in landing
+/// order, so a stream that reordered would pair a request with another
+/// generation's measurement.
+pub fn project(events: &[Event]) -> Vec<Distillate> {
+    project_as(events, None)
+}
+
+/// The projection landed under another session name, per Spec section 4:
+/// every distillate's session member rewritten as it crosses and the run
+/// and sequence as recorded, which is what a branch needs because the
+/// member bounds every answer to the session its opener declared. `None`
+/// keeps the record's own name.
+pub fn project_as(events: &[Event], session: Option<&str>) -> Vec<Distillate> {
+    project_with(events, session, &Election::diagnostic())
+}
+
+/// Both modes use this selector. Unknown elected material remains raw.
+pub fn project_with(
+    events: &[Event],
+    session: Option<&str>,
+    election: &Election,
+) -> Vec<Distillate> {
+    let mut out = Vec::new();
+    for event in events {
+        let mut selected = std::collections::BTreeMap::new();
+        // The tee's whole-distill rule, mirrored for a preload: the seated
+        // identity and a branch's restored conversation cross whole under
+        // every election, per `weaver-trace-Spec` section 11 (#697).
+        if (event.envelope.kind == "message.system" && event.envelope.turn.is_none())
+            || event.envelope.kind == "message.restored"
+        {
+            if let Some(payload) = &event.payload {
+                let Ok(members) = serde_json::from_str::<
+                    std::collections::BTreeMap<String, &serde_json::value::RawValue>,
+                >(payload.get()) else {
+                    continue;
+                };
+                selected = members;
+            }
+        } else {
+            let entry = election.keys.iter().find(|e| e.kind == event.envelope.kind);
+            if !election.all_kinds && entry.is_none() {
+                continue;
+            }
+            if let (Some(entry), Some(payload)) = (entry, &event.payload) {
+                for path in &entry.paths {
+                    if let Some(value) = value_at(payload, path) {
+                        selected.insert(path.clone(), value);
+                    }
+                }
+            }
+        }
+        let pairs = serde_json::to_string(&selected).expect("raw pairs render");
+        let mut envelope = format!(
+            "{{\"session\":{},\"run\":{},",
+            serde_json::json!(session.unwrap_or(event.envelope.session.as_str())),
+            serde_json::json!(event.envelope.run),
+        );
+        if let Some(turn) = &event.envelope.turn {
+            envelope.push_str(&format!("\"turn\":{},", serde_json::json!(turn)));
+        }
+        envelope.push_str(&format!(
+            "\"kind\":{},\"sequence\":{}",
+            serde_json::json!(event.envelope.kind),
+            serde_json::json!(event.envelope.sequence),
+        ));
+        let frame = format!("{{\"envelope\":{envelope}}},\"pairs\":{pairs}}}\n");
+        out.push(Distillate { frame });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::parse_record;
+
+    fn record() -> String {
+        concat!(
+            r#"{"session":"s-1","run":"r-a","sequence":"0","kind":"load","payload":{"tee":{}}}"#, "\n",
+            r#"{"session":"s-1","run":"r-a","sequence":"1","kind":"message.system","payload":{"role":"system","content":[{"type":"text","text":"You are Karl."}]}}"#, "\n",
+            r#"{"session":"s-1","run":"r-a","turn":"t-1","sequence":"2","kind":"message.user","payload":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#, "\n",
+            r#"{"session":"s-1","run":"r-a","turn":"t-1","sequence":"3","kind":"turn.closed","payload":{}}"#, "\n",
+            r#"{"session":"s-1","run":"r-a","turn":"t-2","sequence":"4","kind":"message.user","payload":{"role":"user","content":[{"type":"text","text":"more"}]}}"#, "\n",
+            r#"{"session":"s-1","run":"r-a","turn":"t-2","sequence":"5","kind":"turn.closed","payload":{}}"#, "\n",
+            r#"{"session":"s-1","run":"r-b","sequence":"6","kind":"load","payload":{"tee":{}}}"#, "\n",
+            r#"{"session":"s-1","run":"r-b","turn":"t-1","sequence":"7","kind":"turn.closed","payload":{}}"#, "\n",
+            r#"{"session":"s-1","run":"r-b","turn":"t-2","sequence":"8","kind":"message.user","payload":{"role":"user","content":[{"type":"text","text":"cut off"}]}}"#, "\n",
+        )
+        .to_string()
+    }
+
+    /// **A branch's restored conversation crosses a preload whole**, as the
+    /// identity does, under an election that names nothing of it (#697): a
+    /// restore from a preloaded branch rebuilds the inherited exchange from
+    /// these pairs, so no election may thin them. The diagnostic election
+    /// names the four message kinds and not this one, which is what makes the
+    /// rule and not an entry the instrument here.
+    ///
+    /// Perturbation: drop `message.restored` from `project_with`'s whole-line
+    /// rule and the frame crosses with no pairs.
+    #[test]
+    fn a_restored_message_crosses_a_preload_whole() {
+        let record = concat!(
+            r#"{"session":"s-1","run":"r-a","sequence":"1","kind":"message.restored","#,
+            r#""payload":{"role":"user","content":[{"type":"text","text":"inherited"}]}}"#,
+            "\n",
+        );
+        let frames = project_with(
+            &parse_record(record),
+            None,
+            &crate::selection::Election::diagnostic(),
+        );
+        assert_eq!(frames.len(), 1, "the restored row crosses");
+        assert!(
+            frames[0].frame.contains(
+                r#""pairs":{"content":[{"type":"text","text":"inherited"}],"role":"user"}"#
+            ),
+            "whole, role and content: {}",
+            frames[0].frame
+        );
+    }
+
+    /// **The cut is the named turn's last event in landing order**, per
+    /// Spec section 4: everything through it crosses and nothing after, a
+    /// run or turn the record does not hold refuses naming it.
+    ///
+    /// Perturbation: return the whole record from `cut_through` and the
+    /// count assertion fails, events past the turn crossing. Watched under
+    /// exactly that change.
+    #[test]
+    fn the_cut_projects_through_the_turns_last_event_and_none_after() {
+        let text = record();
+        let events = parse_record(&text);
+        let through = cut_through(&events, "r-a", 1).expect("the cut exists");
+        assert_eq!(through.len(), 4, "the load, the prefix, and turn one whole");
+        assert_eq!(
+            through.last().unwrap().envelope.sequence,
+            "3",
+            "turn one's close"
+        );
+        assert_eq!(
+            cut_through(&events, "r-zz", 1).err(),
+            Some(CutRefusal::RunNotHeld("r-zz".into()))
+        );
+        assert_eq!(
+            cut_through(&events, "r-a", 9).err(),
+            Some(CutRefusal::TurnNotHeld {
+                run: "r-a".into(),
+                turn: 9
+            })
+        );
+        // A turn held without its close refuses distinctly: a run that
+        // died mid-turn is a cut inside a generation.
+        assert_eq!(
+            cut_through(&events, "r-b", 2).err(),
+            Some(CutRefusal::TurnNotClosed {
+                run: "r-b".into(),
+                turn: 2
+            })
+        );
+    }
+
+    /// **The rename touches the envelope's session alone**, per Spec
+    /// section 4: every distillate carries the new name with its run and
+    /// sequence as recorded, and no name is given, the record's stands.
+    ///
+    /// Perturbation: drop the rewrite in `project_as` and the first
+    /// assertion fails, a distillate keeping the record's name under an
+    /// opener that declared another. Watched under exactly that change.
+    #[test]
+    fn the_rename_rewrites_the_session_and_nothing_else() {
+        let text = record();
+        let events = parse_record(&text);
+        let renamed = project_as(&events, Some("s-2"));
+        assert!(!renamed.is_empty());
+        for distillate in &renamed {
+            assert!(
+                distillate.frame.contains("\"session\":\"s-2\""),
+                "{}",
+                distillate.frame
+            );
+            assert!(
+                !distillate.frame.contains("s-1"),
+                "the record's name is gone"
+            );
+        }
+        assert!(
+            renamed[0].frame.contains("\"run\":\"r-a\""),
+            "the run is as recorded"
+        );
+        let kept = project(&events);
+        assert!(
+            kept[0].frame.contains("\"session\":\"s-1\""),
+            "no name given, the record's stands"
+        );
+    }
+
+    /// **The election names the four message kinds with role and content**,
+    /// per Spec section 3 as of 2026-09-06, so a restoring open has the
+    /// pairs it rebuilds from.
+    ///
+    /// Perturbation: drop a message kind from `ELECTION` and its distillate
+    /// carries no pairs, the assertion on `content` failing. Watched under
+    /// exactly that removal.
+    #[test]
+    fn the_election_carries_the_conversation_for_the_open() {
+        let text = record();
+        let events = parse_record(&text);
+        let out = project(&events);
+        let user = out
+            .iter()
+            .find(|d| d.frame.contains("\"kind\":\"message.user\""))
+            .expect("the user message crosses");
+        assert!(user.frame.contains("\"role\":\"user\""));
+        assert!(
+            user.frame.contains("\"content\":["),
+            "the content crosses spliced"
+        );
+        let system = out
+            .iter()
+            .find(|d| d.frame.contains("\"kind\":\"message.system\""))
+            .expect("the prefix crosses");
+        assert!(system.frame.contains("You are Karl."));
+    }
+}
