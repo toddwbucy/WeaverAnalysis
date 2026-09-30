@@ -128,18 +128,18 @@ from: weaver-analysis
 to: analysis-no-runtime-no-socket-crate
 ```
 
-**No crate in this workspace depends on this one, of any kind**, on the operator's
-condition of 2026-09-26 for this crate staying in the repository when `weaver-web`
-left it. The claim above keeps the interior out of this crate. This one keeps this
-crate out of the interior, so it stays a leaf that can leave the tree the way the web
-did without any member's build changing. A normal, build or dev dependency on it,
-direct or renamed, target-qualified or optional, is the dependency the condition
-forbids, and the instrument reads cargo's declared dependencies of every workspace
-member rather than a manifest's text so every one of those routes is seen. **It reads
-every `crates/*/Cargo.toml` against the member set** as well, so a crate standing
-under `crates/` outside the workspace is a refusal rather than a member the read never
-saw. The record carries no `grounds` edge: the condition is the operator's for where
-this crate lives, not an invariant of the agent.
+**No crate depends on this one, of any kind**, on the operator's condition of
+2026-09-26, first stated for this crate staying in the monorepo when `weaver-web` left
+it and kept when this crate left in turn on 2026-09-30. The claim above keeps the
+interior out of this crate. This one keeps this crate out of the interior, so it stays
+a leaf, which is what let it become its own repository without any member's build
+changing. The crate is now the whole of its workspace, and the instrument reads that as
+the fact it is: `tests/manifest.rs` asserts the workspace resolves to exactly this crate
+at the repository root, and reads cargo's declared dependencies of every member rather
+than a manifest's text, so a dependent that arrived by any route, normal, build or dev,
+direct or renamed, target-qualified or optional, would be a refusal rather than a member
+the read never saw. The record carries no `grounds` edge: the condition is the
+operator's for where this crate lives, not an invariant of the agent.
 
 ```graph
 node: analysis-no-crate-depends-on-it
